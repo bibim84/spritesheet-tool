@@ -1,0 +1,599 @@
+import sys
+import os
+import math
+import threading
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QRadioButton, QButtonGroup, QProgressBar,
+    QFileDialog, QMessageBox, QDialog, QLineEdit, QFrame
+)
+from PyQt6.QtCore import Qt, pyqtSignal, QObject
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent
+from PIL import Image
+
+# ── 상수 ──────────────────────────────────────────────────────────────────
+SUFFIXES   = ["01", "02", "03", "f", "c", "b", "d", "e"]
+RANGES_144 = [(1,10),(11,14),(15,24),(25,36),(37,66),(73,86),(91,108),(109,144)]
+RANGES_296 = [(1,10),(11,26),(27,60),(61,84),(85,152),(159,184),(189,244),(245,296)]
+MAX_W = 16384
+
+# ── GIF 프레임 추출 ────────────────────────────────────────────────────────
+def extract_gif_frames(path):
+    frames = []
+    with Image.open(path) as img:
+        w, h = img.size
+        # 누적 캔버스 (RGBA)
+        canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        try:
+            while True:
+                # 현재 프레임 정보
+                disposal = img.tile[0][3][0] if img.tile else 0
+                frame_x, frame_y = img.tile[0][1][:2] if img.tile else (0, 0)
+
+                # 팔레트 → RGBA 변환 (투명 인덱스 보존)
+                frame = img.copy()
+                if frame.mode == "P":
+                    # 투명 인덱스 확인
+                    transparency = img.info.get("transparency", -1)
+                    frame_rgba = frame.convert("RGBA")
+                    if transparency >= 0:
+                        # 팔레트에서 직접 픽셀 읽어서 투명 처리
+                        data = frame.getdata()
+                        palette = frame.getpalette()
+                        pixels = []
+                        for idx in data:
+                            if idx == transparency:
+                                pixels.append((0, 0, 0, 0))
+                            else:
+                                r = palette[idx * 3]
+                                g = palette[idx * 3 + 1]
+                                b = palette[idx * 3 + 2]
+                                pixels.append((r, g, b, 255))
+                        frame_rgba = Image.new("RGBA", frame.size)
+                        frame_rgba.putdata(pixels)
+                else:
+                    frame_rgba = frame.convert("RGBA")
+
+                # 캔버스에 합성
+                # 투명 픽셀은 이전 캔버스 유지
+                canvas_copy = canvas.copy()
+                canvas_copy.paste(frame_rgba, (0, 0), frame_rgba)
+                canvas = canvas_copy
+
+                frames.append(canvas.copy())
+
+                # disposal 처리
+                if disposal == 2:
+                    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+                img.seek(img.tell() + 1)
+        except EOFError:
+            pass
+    return frames, w, h
+
+# ── PSD 레이어 추출 ────────────────────────────────────────────────────────
+def extract_psd_frames(path):
+    try:
+        from psd_tools import PSDImage
+    except ImportError:
+        raise ImportError("psd_tools 라이브러리가 필요합니다.\ncmd에서 실행하세요:\npip install psd-tools")
+
+    psd = PSDImage.open(path)
+    w, h = psd.width, psd.height
+    layers = [l for l in psd if l.is_visible()]
+    frames = []
+
+    for layer in layers:
+        # 전체 캔버스 크기의 빈 프레임
+        frame = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        try:
+            # layer.topil()로 픽셀 데이터를 직접 가져옴
+            # composite() 대신 topil() 사용 → 알파/블러 손실 없음
+            layer_img = layer.topil()
+            if layer_img:
+                layer_rgba = layer_img.convert("RGBA")
+                # alpha_composite로 합성 → paste()보다 알파값 정확
+                tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                tmp.paste(layer_rgba, (layer.left, layer.top))
+                frame = Image.alpha_composite(frame, tmp)
+        except Exception:
+            try:
+                # topil() 실패시 numpy로 직접 픽셀 읽기
+                import numpy as np
+                arr = layer.numpy()
+                if arr is not None:
+                    if arr.shape[2] == 4:
+                        layer_img = Image.fromarray((arr * 255).astype(np.uint8), "RGBA")
+                    else:
+                        layer_img = Image.fromarray((arr * 255).astype(np.uint8), "RGB").convert("RGBA")
+                    tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                    tmp.paste(layer_img, (layer.left, layer.top))
+                    frame = Image.alpha_composite(frame, tmp)
+            except Exception:
+                pass
+        frames.append(frame)
+
+    if not frames:
+        raise ValueError("추출할 레이어가 없습니다.")
+    return frames, w, h
+
+# ── 스프라이트 시트 빌드 ───────────────────────────────────────────────────
+def build_sheet(frames, fw, fh, cols=None, rows=None):
+    total = len(frames)
+    if not total:
+        return None
+    if cols and rows:
+        pass
+    elif cols:
+        rows = math.ceil(total / cols)
+    elif rows:
+        cols = math.ceil(total / rows)
+    else:
+        single_w = fw * total
+        if single_w > MAX_W:
+            rows = 2
+            cols = math.ceil(total / 2)
+        else:
+            rows = 1
+            cols = total
+    sheet = Image.new("RGBA", (fw * cols, fh * rows), (0, 0, 0, 0))
+    for i, frame in enumerate(frames):
+        row = i // cols
+        col = i % cols
+        if row >= rows:
+            break
+        sheet.paste(frame, (col * fw, row * fh))
+    return sheet
+
+# ── 시그널 브릿지 (스레드 → 메인 스레드) ──────────────────────────────────
+class Bridge(QObject):
+    message = pyqtSignal(str, str)
+    status  = pyqtSignal(str, str)
+    prog    = pyqtSignal(int)
+    done    = pyqtSignal()
+
+# ── 드롭존 ────────────────────────────────────────────────────────────────
+class DropZone(QWidget):
+    file_dropped = pyqtSignal(str)
+    multi_files_dropped = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(100)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel("🎞  GIF / PSD 파일을 여기에 드래그하거나 클릭하세요")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("font-size: 13px; font-weight: bold; color: #4f8ef7;")
+        layout.addWidget(self.label)
+        self._normal()
+
+    def _normal(self):
+        self.setStyleSheet("DropZone{border:2px dashed #4f8ef7;border-radius:10px;background:#eef4ff;padding:20px;}")
+
+    def _hover(self):
+        self.setStyleSheet("DropZone{border:2px dashed #111;border-radius:10px;background:#dce8ff;padding:20px;}")
+
+    def setText(self, t):
+        self.label.setText(t)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self._hover()
+
+    def dragLeaveEvent(self, e):
+        self._normal()
+
+    def dropEvent(self, e):
+        self._normal()
+        if e.mimeData().hasUrls():
+            urls = e.mimeData().urls()
+            if len(urls) == 1:
+                self.file_dropped.emit(urls[0].toLocalFile())
+            else:
+                paths = [u.toLocalFile() for u in urls]
+                self.multi_files_dropped.emit(paths)
+            e.acceptProposedAction()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.file_dropped.emit("")
+
+# ── 저장 다이얼로그 ────────────────────────────────────────────────────────
+class SaveDialog(QDialog):
+    def __init__(self, parent, mode, base_name):
+        super().__init__(parent)
+        self.setWindowTitle("파일명 입력")
+        self.setFixedSize(440, 260)
+        self.result_name = None
+        self.result_folder = None
+        ranges = RANGES_144 if mode == "144" else RANGES_296
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.addWidget(QLabel("<b>파일명 (공통 접두사)</b>"))
+        self.entry = QLineEdit(base_name)
+        self.entry.setStyleSheet("padding:8px;border:1px solid #ccc;border-radius:6px;font-size:13px;")
+        layout.addWidget(self.entry)
+        preview = "  ".join([f"{SUFFIXES[i]}.png ({r[0]}~{r[1]})" for i, r in enumerate(ranges)])
+        lbl = QLabel(f"<small><b>저장될 파일:</b><br><span style='color:#3a5ccc'>{preview}</span></small>")
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+        btn_layout = QHBoxLayout()
+        cancel_btn = QPushButton("취소")
+        cancel_btn.setStyleSheet("padding:8px 20px;background:#e0e0e0;border:none;border-radius:6px;")
+        cancel_btn.clicked.connect(self.reject)
+        confirm_btn = QPushButton("저장하기")
+        confirm_btn.setStyleSheet("padding:8px 20px;background:#4f8ef7;color:white;border:none;border-radius:6px;font-weight:bold;")
+        confirm_btn.clicked.connect(self.confirm)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(confirm_btn)
+        layout.addLayout(btn_layout)
+        self.entry.returnPressed.connect(self.confirm)
+
+    def confirm(self):
+        name = self.entry.text().strip()
+        if not name:
+            QMessageBox.warning(self, "경고", "파일명을 입력하세요.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "저장 폴더 선택")
+        if not folder:
+            return
+        self.result_name = name
+        self.result_folder = folder
+        self.accept()
+
+# ── 메인 윈도우 ───────────────────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("GIF / PSD → Sprite Sheet")
+        self.setFixedSize(660, 520)
+        self.setAcceptDrops(True)
+        self.file_path = None
+        self.multi_paths = []  # 다중 파일 목록
+        self.frames = []
+        self.fw = self.fh = 0
+        self.mode = "normal"
+        self._build_ui()
+        self._bridge = Bridge()
+        self._bridge.message.connect(lambda t, m: QMessageBox.information(self, t, m))
+        self._bridge.status.connect(lambda t, c: (self.status_label.setText(t), self.status_label.setStyleSheet(f"font-size:11px;color:{c};")))
+        self._bridge.prog.connect(self.progress.setValue)
+        self._bridge.done.connect(lambda: self.extract_btn.setEnabled(True))
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        if e.mimeData().hasUrls():
+            urls = e.mimeData().urls()
+            if len(urls) == 1:
+                # 파일 1개 → 기존 방식
+                self.on_file(urls[0].toLocalFile())
+            else:
+                # 파일 여러 개 → 일괄 처리
+                paths = [u.toLocalFile() for u in urls]
+                self.on_multi_files(paths)
+            e.acceptProposedAction()
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setSpacing(12)
+        layout.setContentsMargins(24, 24, 24, 24)
+
+        title = QLabel("GIF / PSD → Sprite Sheet")
+        title.setStyleSheet("font-size:20px;font-weight:bold;color:#111;")
+        layout.addWidget(title)
+
+        sub = QLabel("원본 색상 완벽 보존  ·  16,384px 초과 시 2줄 자동 배치")
+        sub.setStyleSheet("font-size:11px;color:#888;")
+        layout.addWidget(sub)
+
+        self.drop_zone = DropZone()
+        self.drop_zone.file_dropped.connect(self.on_file)
+        self.drop_zone.multi_files_dropped.connect(self.on_multi_files)
+        layout.addWidget(self.drop_zone)
+
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("font-size:11px;color:#555;")
+        layout.addWidget(self.info_label)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet("color:#e5e7eb;")
+        layout.addWidget(line)
+
+        mode_layout = QHBoxLayout()
+        mode_label = QLabel("<b>추출 모드:</b>")
+        mode_label.setStyleSheet("font-size:12px;")
+        mode_layout.addWidget(mode_label)
+        self.mode_group = QButtonGroup()
+        for val, label in [("normal","일반"),("144","144프레임"),("296","296프레임")]:
+            rb = QRadioButton(label)
+            rb.setStyleSheet("font-size:12px;")
+            if val == "normal":
+                rb.setChecked(True)
+            rb.toggled.connect(lambda checked, v=val: self.on_mode(v) if checked else None)
+            self.mode_group.addButton(rb)
+            mode_layout.addWidget(rb)
+        mode_layout.addStretch()
+        layout.addLayout(mode_layout)
+
+        self.range_label = QLabel("")
+        self.range_label.setStyleSheet("font-size:10px;color:#3a5ccc;")
+        layout.addWidget(self.range_label)
+
+        # 가로/세로 입력
+        self.grid_frame = QWidget()
+        grid_layout = QHBoxLayout(self.grid_frame)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(8)
+        grid_layout.addWidget(QLabel("가로 (열):"))
+        self.cols_input = QLineEdit()
+        self.cols_input.setPlaceholderText("자동")
+        self.cols_input.setFixedWidth(60)
+        self.cols_input.setStyleSheet("padding:4px;border:1px solid #ccc;border-radius:4px;font-size:12px;")
+        grid_layout.addWidget(self.cols_input)
+        grid_layout.addWidget(QLabel("세로 (행):"))
+        self.rows_input = QLineEdit()
+        self.rows_input.setPlaceholderText("자동")
+        self.rows_input.setFixedWidth(60)
+        self.rows_input.setStyleSheet("padding:4px;border:1px solid #ccc;border-radius:4px;font-size:12px;")
+        grid_layout.addWidget(self.rows_input)
+        self.grid_info = QLabel("")
+        self.grid_info.setStyleSheet("font-size:10px;color:#888;")
+        grid_layout.addWidget(self.grid_info)
+        grid_layout.addStretch()
+        layout.addWidget(self.grid_frame)
+        self.cols_input.textChanged.connect(self.update_grid_info)
+        self.rows_input.textChanged.connect(self.update_grid_info)
+
+        self.extract_btn = QPushButton("추출하기")
+        self.extract_btn.setEnabled(False)
+        self.extract_btn.setStyleSheet("""
+            QPushButton{background:#111;color:white;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:bold;}
+            QPushButton:hover{background:#333;}
+            QPushButton:disabled{background:#ccc;}
+        """)
+        self.extract_btn.clicked.connect(self.extract)
+        layout.addWidget(self.extract_btn)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("font-size:11px;color:#4f8ef7;")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        self.progress = QProgressBar()
+        self.progress.setStyleSheet("""
+            QProgressBar{border:none;background:#e5e7eb;border-radius:4px;height:8px;}
+            QProgressBar::chunk{background:#4f8ef7;border-radius:4px;}
+        """)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        layout.addWidget(self.progress)
+
+    def on_mode(self, val):
+        self.mode = val
+        if val == "144":
+            self.range_label.setText("  ".join([f"{SUFFIXES[i]}: {r[0]}~{r[1]}" for i, r in enumerate(RANGES_144)]))
+            self.grid_frame.setVisible(False)
+        elif val == "296":
+            self.range_label.setText("  ".join([f"{SUFFIXES[i]}: {r[0]}~{r[1]}" for i, r in enumerate(RANGES_296)]))
+            self.grid_frame.setVisible(False)
+        else:
+            self.range_label.setText("")
+            self.grid_frame.setVisible(True)
+            self.update_grid_info()
+
+    def update_grid_info(self):
+        total = len(self.frames)
+        cols_text = self.cols_input.text().strip()
+        rows_text = self.rows_input.text().strip()
+        try:
+            cols = int(cols_text) if cols_text else None
+            rows = int(rows_text) if rows_text else None
+            if cols and rows:
+                self.grid_info.setText(f"→ {cols}열 × {rows}행 = {cols*rows}프레임 배치")
+            elif cols:
+                auto_rows = math.ceil(total / cols) if total > 0 else "?"
+                self.grid_info.setText(f"→ 세로 {auto_rows}행 자동 계산")
+            elif rows:
+                auto_cols = math.ceil(total / rows) if total > 0 else "?"
+                self.grid_info.setText(f"→ 가로 {auto_cols}열 자동 계산")
+            else:
+                self.grid_info.setText("→ 가로 또는 세로를 입력하세요")
+        except ValueError:
+            self.grid_info.setText("→ 숫자를 입력하세요")
+
+    def on_multi_files(self, paths):
+        valid = [p for p in paths if os.path.splitext(p)[1].lower() in (".gif", ".psd")]
+        if not valid:
+            QMessageBox.critical(self, "오류", "GIF 또는 PSD 파일만 지원합니다.")
+            return
+
+        # 파일 목록만 저장해두고 UI 업데이트
+        self.multi_paths = valid
+        self.frames = []  # 단일 파일 모드 초기화
+        self.drop_zone.setText(f"🎞  {len(valid)}개 파일 선택됨")
+        self.info_label.setText("  ".join([os.path.basename(p) for p in valid]))
+        self.extract_btn.setEnabled(True)
+        self.status_label.setText(f"✅ {len(valid)}개 파일 로드 완료")
+        self.status_label.setStyleSheet("font-size:11px;color:#27ae60;")
+
+    def on_file(self, path):
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "파일 선택", "",
+                "지원 파일 (*.gif *.psd);;GIF (*.gif);;PSD (*.psd)")
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".gif", ".psd"):
+            QMessageBox.critical(self, "오류", "GIF 또는 PSD 파일만 지원합니다.")
+            return
+        self.file_path = path
+        self.frames = []
+        self.extract_btn.setEnabled(False)
+        self.status_label.setText("파싱 중...")
+        self.progress.setValue(0)
+        self.drop_zone.setText(f"🎞  {os.path.basename(path)}")
+
+        def _load():
+            try:
+                if ext == ".gif":
+                    frames, fw, fh = extract_gif_frames(path)
+                    type_info = "GIF"
+                else:
+                    frames, fw, fh = extract_psd_frames(path)
+                    type_info = "PSD (레이어별)"
+                self.frames = frames
+                self.fw, self.fh = fw, fh
+                total_w = fw * len(frames)
+                split = "  →  2줄 배치" if total_w > MAX_W else ""
+                self.info_label.setText(f"[{type_info}]  {len(frames)}프레임  ·  {fw}×{fh}px  ·  예상 너비 {total_w:,}px{split}")
+                self._bridge.status.emit("✅ 로드 완료", "#27ae60")
+                self.extract_btn.setEnabled(True)
+                self.update_grid_info()
+            except Exception as e:
+                self._bridge.message.emit("오류", f"파일 로드 실패:\n{e}")
+                self._bridge.status.emit("", "#4f8ef7")
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def extract(self):
+        if not self.frames and not self.multi_paths:
+            return
+        self.extract_btn.setEnabled(False)
+
+        # 다중 파일 모드
+        if self.multi_paths:
+            folder = QFileDialog.getExistingDirectory(self, "저장 폴더 선택")
+            if not folder:
+                self.extract_btn.setEnabled(True)
+                return
+            valid = self.multi_paths
+            total = len(valid)
+
+            def _process():
+                for i, path in enumerate(valid):
+                    fname = os.path.basename(path)
+                    ext = os.path.splitext(path)[1].lower()
+                    base = os.path.splitext(fname)[0]
+                    self._bridge.status.emit(f"처리 중... ({i+1}/{total})  {fname}", "#4f8ef7")
+                    self._bridge.prog.emit(int((i / total) * 100))
+                    try:
+                        if ext == ".gif":
+                            frames, fw, fh = extract_gif_frames(path)
+                        else:
+                            frames, fw, fh = extract_psd_frames(path)
+
+                        if self.mode == "normal":
+                            cols_text = self.cols_input.text().strip()
+                            rows_text = self.rows_input.text().strip()
+                            cols = int(cols_text) if cols_text else None
+                            rows = int(rows_text) if rows_text else None
+                            if not cols and not rows:
+                                cols = len(frames)
+                                rows = 1
+                            sheet = build_sheet(frames, fw, fh, cols=cols, rows=rows)
+                            sheet.save(os.path.join(folder, f"{base}sheet.png"), "PNG")
+                        else:
+                            ranges = RANGES_144 if self.mode == "144" else RANGES_296
+                            for j, (start, end) in enumerate(ranges):
+                                slice_frames = frames[start-1:end]
+                                if not slice_frames:
+                                    continue
+                                sheet = build_sheet(slice_frames, fw, fh)
+                                sheet.save(os.path.join(folder, f"{base}{SUFFIXES[j]}.png"), "PNG")
+                    except Exception as e:
+                        self._bridge.message.emit("오류", f"{fname} 처리 실패:\n{e}")
+
+                self._bridge.prog.emit(100)
+                self._bridge.status.emit(f"✅ {total}개 파일 처리 완료!", "#27ae60")
+                self._bridge.message.emit("완료", f"{total}개 파일 저장 완료!\n폴더: {folder}")
+                self._bridge.done.emit()
+
+            threading.Thread(target=_process, daemon=True).start()
+            return
+
+        if self.mode == "normal":
+            cols_text = self.cols_input.text().strip()
+            rows_text = self.rows_input.text().strip()
+            try:
+                cols = int(cols_text) if cols_text else None
+                rows = int(rows_text) if rows_text else None
+            except ValueError:
+                QMessageBox.warning(self, "경고", "가로/세로에 올바른 숫자를 입력하세요.")
+                self.extract_btn.setEnabled(True)
+                return
+            if not cols and not rows:
+                QMessageBox.warning(self, "경고", "가로 또는 세로 중 하나는 입력하세요.")
+                self.extract_btn.setEnabled(True)
+                return
+
+            base = os.path.splitext(os.path.basename(self.file_path))[0]
+            save_path, _ = QFileDialog.getSaveFileName(self, "저장 위치 선택", base + "sheet.png", "PNG (*.png)")
+            if not save_path:
+                self.extract_btn.setEnabled(True)
+                return
+
+            def _save():
+                try:
+                    self._bridge.status.emit("스프라이트 시트 생성 중...", "#4f8ef7")
+                    self._bridge.prog.emit(0)
+                    sheet = build_sheet(self.frames, self.fw, self.fh, cols=cols, rows=rows)
+                    self._bridge.prog.emit(80)
+                    sheet.save(save_path, "PNG")
+                    self._bridge.prog.emit(100)
+                    self._bridge.status.emit(f"✅ 저장 완료: {os.path.basename(save_path)}", "#27ae60")
+                    self._bridge.message.emit("완료", f"저장 완료!\n{save_path}")
+                except Exception as e:
+                    self._bridge.message.emit("오류", str(e))
+                finally:
+                    self._bridge.done.emit()
+
+            threading.Thread(target=_save, daemon=True).start()
+
+        else:
+            base = os.path.splitext(os.path.basename(self.file_path))[0]
+            dlg = SaveDialog(self, self.mode, base)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self.extract_btn.setEnabled(True)
+                return
+            name = dlg.result_name
+            folder = dlg.result_folder
+            ranges = RANGES_144 if self.mode == "144" else RANGES_296
+
+            def _save_ranges():
+                try:
+                    total = len(ranges)
+                    for i, (start, end) in enumerate(ranges):
+                        self._bridge.status.emit(f"저장 중... ({i+1}/{total})  {name}{SUFFIXES[i]}.png", "#4f8ef7")
+                        self._bridge.prog.emit(int((i / total) * 100))
+                        slice_frames = self.frames[start-1:end]
+                        if not slice_frames:
+                            continue
+                        sheet = build_sheet(slice_frames, self.fw, self.fh)
+                        sheet.save(os.path.join(folder, f"{name}{SUFFIXES[i]}.png"), "PNG")
+                    self._bridge.prog.emit(100)
+                    self._bridge.status.emit(f"✅ {total}개 파일 저장 완료", "#27ae60")
+                    self._bridge.message.emit("완료", f"{total}개 파일 저장 완료!\n폴더: {folder}")
+                except Exception as e:
+                    self._bridge.message.emit("오류", str(e))
+                finally:
+                    self._bridge.done.emit()
+
+            threading.Thread(target=_save_ranges, daemon=True).start()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
